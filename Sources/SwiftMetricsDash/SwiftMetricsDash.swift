@@ -87,12 +87,23 @@ class SwiftMetricsService: WebSocketService {
 
     private var connections = [String: WebSocketConnection]()
     var httpAggregateData: HTTPAggregateData = HTTPAggregateData()
-    var httpURLData:[String:(totalTime:Double, numHits:Double)] = [:]
+    var httpURLData:[String:(totalTime:Double, numHits:Double, longestTime:Double)] = [:]
     let httpURLsQueue = DispatchQueue(label: "httpURLsQueue")
     let httpQueue = DispatchQueue(label: "httpStoreQueue")
     let jobsQueue = DispatchQueue(label: "jobsQueue")
     var monitor:SwiftMonitor
     let encoder = JSONEncoder()
+
+    // CPU summary data
+    var totalProcessCPULoad: Double = 0.0;
+    var totalSystemCPULoad: Double = 0.0;
+    var cpuLoadSamples: Double = 0
+
+    // Memory summary data
+    var totalProcessMemory: Int = 0;
+    var totalSystemMemory: Int = 0;
+    var memorySamples: Int = 0;
+
 
 
     public init(monitor: SwiftMonitor) {
@@ -105,8 +116,13 @@ class SwiftMetricsService: WebSocketService {
 
 
     func sendCPU(cpu: CPUData) {
-        let cpuDashData = DashData(topic: "cpu", payload: cpu)
-        let data = try! encoder.encode(cpuDashData)
+        totalProcessCPULoad += Double(cpu.percentUsedByApplication);
+        totalSystemCPULoad += Double(cpu.percentUsedBySystem);
+        cpuLoadSamples += 1;
+        let processMean = (totalProcessCPULoad / cpuLoadSamples);
+        let systemMean = (totalSystemCPULoad / cpuLoadSamples);
+
+        let cpuLine = JSON(["topic":"cpu", "payload":["time":"\(cpu.timeOfSample)","process":"\(cpu.percentUsedByApplication)","system":"\(cpu.percentUsedBySystem)","processMean":"\(processMean)","systemMean":"\(systemMean)"]])
 
         for (_,connection) in connections {
           connection.send(message: String(data: data, encoding: .utf8)!)
@@ -116,8 +132,19 @@ class SwiftMetricsService: WebSocketService {
 
 
     func sendMEM(mem: MemData) {
-        let memDashData = DashData(topic: "memory", payload: mem)
-        let data = try! encoder.encode(memDashData)
+        totalProcessMemory += mem.applicationRAMUsed;
+        totalSystemMemory += mem.totalRAMUsed;
+        memorySamples += 1;
+        let processMean = (totalProcessMemory / memorySamples);
+        let systemMean = (totalSystemMemory / memorySamples);
+
+        let memLine = JSON(["topic":"memory","payload":[
+                "time":"\(mem.timeOfSample)",
+                "physical":"\(mem.applicationRAMUsed)",
+                "physical_used":"\(mem.totalRAMUsed)",
+                "processMean":"\(processMean)",
+                "systemMean":"\(systemMean)"
+                ]])
 
         for (_,connection) in connections {
           connection.send(message: String(data: data, encoding: .utf8)!)
@@ -211,10 +238,14 @@ class SwiftMetricsService: WebSocketService {
             if(urlTuple != nil) {
                 let averageResponseTime = urlTuple!.0
                 let hits = urlTuple!.1
+                var longest = urlTuple!.2
+                if (localmyhttp.duration > longest) {
+                    longest = localmyhttp.duration
+                }
                 // Recalculate the average
-                self.httpURLData.updateValue(((averageResponseTime * hits + localmyhttp.duration)/(hits + 1), hits + 1), forKey: localmyhttp.url)
+                self.httpURLData.updateValue(((averageResponseTime * hits + localmyhttp.duration)/(hits + 1), hits + 1, longest), forKey: localmyhttp.url)
             } else {
-                self.httpURLData.updateValue((localmyhttp.duration, 1), forKey: localmyhttp.url)
+                self.httpURLData.updateValue((localmyhttp.duration, 1, localmyhttp.duration), forKey: localmyhttp.url)
             }
         }
     }
@@ -236,7 +267,14 @@ class SwiftMetricsService: WebSocketService {
             var messageToSend:String = ""
             let localCopy = self.httpURLData
             for (key, value) in localCopy {
-                  messageToSend = messageToSend + "{\"url\":\"" + key + "\", \"averageResponseTime\": " + String(value.0) + "},"
+                let json = JSON(["url":key, "averageResponseTime": value.0, "hits": value.1, "longestResponseTime": value.2])
+                    responseData.append(json)
+            }
+            var messageToSend:String=""
+
+            // build up the messageToSend string
+            for response in responseData {
+                messageToSend += response.rawString()! + ","
             }
 
             if !messageToSend.isEmpty {
